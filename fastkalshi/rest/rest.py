@@ -1,11 +1,13 @@
+import logging
 import time
-import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import orjson
 import requests
+
+logger = logging.getLogger(__name__)
 
 SESSION = requests.Session()
 WRITE_SESSION = requests.Session()
@@ -38,13 +40,11 @@ def _notify_request_observer(event: KalshiRequestEvent) -> None:
         return
     try:
         observer(event)
-    except Exception as error:  # noqa: BLE001 - observer failures cannot break requests
-        warnings.warn(
-            f"fastkalshi request observer failed: {error}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return
+    except Exception:  # noqa: BLE001 - observer failures cannot break requests
+        try:
+            logger.exception("fastkalshi request observer failed")
+        except Exception:  # noqa: BLE001, S110 - reporting must be isolated
+            pass
 
 
 def _notify_response(

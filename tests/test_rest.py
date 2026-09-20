@@ -1,3 +1,5 @@
+import logging
+import warnings
 from unittest.mock import Mock
 
 import orjson
@@ -145,7 +147,10 @@ def test_request_observer_receives_success_and_error(monkeypatch):
     assert all(event.elapsed_seconds >= 0 for event in events)
 
 
-def test_request_observer_errors_do_not_break_requests(monkeypatch):
+def test_request_observer_errors_are_logged_without_breaking_requests(
+    monkeypatch,
+    caplog,
+):
     rest.set_request_observer(
         lambda _event: (_ for _ in ()).throw(RuntimeError("observer failed"))
     )
@@ -155,10 +160,15 @@ def test_request_observer_errors_do_not_break_requests(monkeypatch):
         Mock(return_value=response(200, {})),
     )
     try:
-        with pytest.warns(RuntimeWarning, match="request observer failed"):
-            assert rest.request("GET", "https://example.test/markets") == {}
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with caplog.at_level(logging.ERROR, logger=rest.__name__):
+                assert rest.request("GET", "https://example.test/markets") == {}
     finally:
         rest.set_request_observer(None)
+
+    assert "fastkalshi request observer failed" in caplog.text
+    assert "observer failed" in caplog.text
 
 
 def test_request_observer_receives_invalid_success_as_error(monkeypatch):
