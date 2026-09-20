@@ -7,12 +7,13 @@ import requests
 from fastkalshi.rest import rest
 
 
-def response(status, payload=None, *, text="", reason=""):
+def response(status, payload=None, *, text="", reason="", headers=None):
     result = Mock()
     result.status_code = status
     result.content = b"" if payload is None else orjson.dumps(payload)
     result.text = text
     result.reason = reason
+    result.headers = headers or {}
     return result
 
 
@@ -84,6 +85,99 @@ def test_request_raises_structured_api_error(monkeypatch):
     assert caught.value.code == "invalid_request"
     assert caught.value.details == {"field": "price"}
     assert caught.value.payload["error"]["message"] == "Bad request"
+
+
+def test_rate_limit_error_exposes_response_metadata(monkeypatch):
+    response_value = response(
+        429,
+        {"error": {"message": "too many requests"}},
+        headers={
+            "Retry-After": "0.25",
+            "X-RateLimit-Limit": "300",
+            "X-RateLimit-Remaining": "0",
+            "X-RateLimit-Reset": "1.5",
+            "X-RateLimit-Bucket": "write",
+            "X-Request-ID": "request-123",
+        },
+    )
+    monkeypatch.setattr(
+        rest.WRITE_SESSION,
+        "request",
+        Mock(return_value=response_value),
+    )
+
+    with pytest.raises(rest.KalshiRateLimitError) as caught:
+        rest.request("POST", "https://example.test/orders", body={})
+
+    assert caught.value.retry_after_seconds == 0.25
+    assert caught.value.limit == 300
+    assert caught.value.remaining == 0
+    assert caught.value.reset == 1.5
+    assert caught.value.bucket == "write"
+    assert caught.value.request_id == "request-123"
+    assert caught.value.response is response_value
+
+
+def test_request_observer_receives_success_and_error(monkeypatch):
+    events = []
+    rest.set_request_observer(events.append)
+    monkeypatch.setattr(
+        rest.SESSION,
+        "request",
+        Mock(
+            side_effect=[
+                response(200, {}, headers={"X-Request-ID": "success"}),
+                response(429, {"error": {"message": "too many requests"}}),
+            ]
+        ),
+    )
+    try:
+        assert rest.request("GET", "https://example.test/markets") == {}
+        with pytest.raises(rest.KalshiRateLimitError):
+            rest.request("GET", "https://example.test/markets")
+    finally:
+        rest.set_request_observer(None)
+
+    assert [event.status_code for event in events] == [200, 429]
+    assert events[0].headers["X-Request-ID"] == "success"
+    assert events[0].error is None
+    assert isinstance(events[1].error, rest.KalshiRateLimitError)
+    assert all(event.elapsed_seconds >= 0 for event in events)
+
+
+def test_request_observer_errors_do_not_break_requests(monkeypatch):
+    rest.set_request_observer(
+        lambda _event: (_ for _ in ()).throw(RuntimeError("observer failed"))
+    )
+    monkeypatch.setattr(
+        rest.SESSION,
+        "request",
+        Mock(return_value=response(200, {})),
+    )
+    try:
+        with pytest.warns(RuntimeWarning, match="request observer failed"):
+            assert rest.request("GET", "https://example.test/markets") == {}
+    finally:
+        rest.set_request_observer(None)
+
+
+def test_request_observer_receives_invalid_success_as_error(monkeypatch):
+    events = []
+    rest.set_request_observer(events.append)
+    monkeypatch.setattr(
+        rest.WRITE_SESSION,
+        "request",
+        Mock(return_value=response(201)),
+    )
+    try:
+        with pytest.raises(rest.KalshiResponseError):
+            rest.request("POST", "https://example.test/orders", body={})
+    finally:
+        rest.set_request_observer(None)
+
+    assert len(events) == 1
+    assert events[0].status_code == 201
+    assert isinstance(events[0].error, rest.KalshiResponseError)
 
 
 @pytest.mark.parametrize(

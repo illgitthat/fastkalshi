@@ -1,3 +1,7 @@
+import time
+import warnings
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import orjson
@@ -7,6 +11,98 @@ SESSION = requests.Session()
 WRITE_SESSION = requests.Session()
 DEFAULT_TIMEOUT = 10.0
 type RequestTimeout = float | tuple[float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class KalshiRequestEvent:
+    method: str
+    url: str
+    status_code: int | None
+    elapsed_seconds: float
+    headers: Mapping[str, str]
+    error: Exception | None = None
+
+
+type RequestObserver = Callable[[KalshiRequestEvent], None]
+_REQUEST_OBSERVER: RequestObserver | None = None
+
+
+def set_request_observer(observer: RequestObserver | None) -> None:
+    global _REQUEST_OBSERVER
+    _REQUEST_OBSERVER = observer
+
+
+def _notify_request_observer(event: KalshiRequestEvent) -> None:
+    observer = _REQUEST_OBSERVER
+    if observer is None:
+        return
+    try:
+        observer(event)
+    except Exception as error:  # noqa: BLE001 - observer failures cannot break requests
+        warnings.warn(
+            f"fastkalshi request observer failed: {error}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+
+
+def _notify_response(
+    *,
+    method: str,
+    url: str,
+    started_at: float,
+    response: requests.Response,
+    error: Exception | None = None,
+) -> None:
+    _notify_request_observer(
+        KalshiRequestEvent(
+            method=method,
+            url=url,
+            status_code=response.status_code,
+            elapsed_seconds=time.perf_counter() - started_at,
+            headers=_response_headers(response),
+            error=error,
+        )
+    )
+
+
+def _response_headers(response: requests.Response | None) -> dict[str, str]:
+    if response is None:
+        return {}
+    headers = getattr(response, "headers", None)
+    if not isinstance(headers, Mapping):
+        return {}
+    return {str(key): str(value) for key, value in headers.items()}
+
+
+def _header_value(headers: Mapping[str, str], *names: str) -> str | None:
+    normalized = {key.lower(): value for key, value in headers.items()}
+    for name in names:
+        value = normalized.get(name.lower())
+        if value:
+            return value
+    return None
+
+
+def _header_float(headers: Mapping[str, str], *names: str) -> float | None:
+    value = _header_value(headers, *names)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _header_int(headers: Mapping[str, str], *names: str) -> int | None:
+    value = _header_value(headers, *names)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 class KalshiAPIError(requests.HTTPError):
@@ -32,9 +128,45 @@ class KalshiAPIError(requests.HTTPError):
         self.message = message
         self.details = details
         self.payload = payload
+        self.headers = _response_headers(response)
+        self.request_id = _header_value(
+            self.headers,
+            "X-Request-ID",
+            "Kalshi-Request-ID",
+        )
         self.outcome_unknown = method not in {"GET", "HEAD", "OPTIONS"} and (
             status_code == 408 or status_code >= 500
         )
+
+
+class KalshiRateLimitError(KalshiAPIError):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        method: str,
+        url: str,
+        code: str | None = None,
+        details: Any = None,
+        payload: Any = None,
+        response: requests.Response | None = None,
+    ):
+        super().__init__(
+            status_code,
+            message,
+            method=method,
+            url=url,
+            code=code,
+            details=details,
+            payload=payload,
+            response=response,
+        )
+        self.retry_after_seconds = _header_float(self.headers, "Retry-After")
+        self.limit = _header_int(self.headers, "X-RateLimit-Limit")
+        self.remaining = _header_int(self.headers, "X-RateLimit-Remaining")
+        self.reset = _header_float(self.headers, "X-RateLimit-Reset")
+        self.bucket = _header_value(self.headers, "X-RateLimit-Bucket")
 
 
 class KalshiTransportError(requests.RequestException):
@@ -100,7 +232,8 @@ def _parse_error(
     error = payload.get("error", payload) if isinstance(payload, dict) else {}
     if not isinstance(error, dict):
         error = {}
-    return KalshiAPIError(
+    error_type = KalshiRateLimitError if response.status_code == 429 else KalshiAPIError
+    return error_type(
         response.status_code,
         error.get("message") or response.text or response.reason,
         method=method,
@@ -131,6 +264,7 @@ def request(
     active_session = session or (
         SESSION if method in {"GET", "HEAD", "OPTIONS"} else WRITE_SESSION
     )
+    started_at = time.perf_counter()
     try:
         response = active_session.request(
             method,
@@ -142,23 +276,78 @@ def request(
             allow_redirects=False,
         )
     except requests.RequestException as error:
-        raise KalshiTransportError(method, url) from error
+        transport_error = KalshiTransportError(method, url)
+        _notify_request_observer(
+            KalshiRequestEvent(
+                method=method,
+                url=url,
+                status_code=None,
+                elapsed_seconds=time.perf_counter() - started_at,
+                headers={},
+                error=transport_error,
+            )
+        )
+        raise transport_error from error
     if not 200 <= response.status_code < 300:
-        raise _parse_error(response, method, url)
+        api_error = _parse_error(response, method, url)
+        _notify_response(
+            method=method,
+            url=url,
+            started_at=started_at,
+            response=response,
+            error=api_error,
+        )
+        raise api_error
     if (
         response.status_code == 204
         or method == "HEAD"
         or (method == "OPTIONS" and not response.content)
     ):
+        _notify_response(
+            method=method,
+            url=url,
+            started_at=started_at,
+            response=response,
+        )
         return None
     if not response.content:
-        raise KalshiResponseError(method, url, response)
+        response_error = KalshiResponseError(method, url, response)
+        _notify_response(
+            method=method,
+            url=url,
+            started_at=started_at,
+            response=response,
+            error=response_error,
+        )
+        raise response_error
     try:
         payload = orjson.loads(response.content)
     except orjson.JSONDecodeError as error:
-        raise KalshiResponseError(method, url, response) from error
+        response_error = KalshiResponseError(method, url, response)
+        _notify_response(
+            method=method,
+            url=url,
+            started_at=started_at,
+            response=response,
+            error=response_error,
+        )
+        raise response_error from error
     if not isinstance(payload, dict):
-        raise KalshiResponseError(method, url, response)
+        response_error = KalshiResponseError(method, url, response)
+        _notify_response(
+            method=method,
+            url=url,
+            started_at=started_at,
+            response=response,
+            error=response_error,
+        )
+        raise response_error
+    _notify_response(
+        method=method,
+        url=url,
+        started_at=started_at,
+        response=response,
+    )
     return payload
 
 

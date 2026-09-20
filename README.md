@@ -140,6 +140,27 @@ costs = account.GetEndpointCosts()
 These methods expose Kalshi's current account buckets and endpoint token
 costs. The SDK does not add sleeps or automatic rate limiting.
 
+HTTP 429 responses raise `KalshiRateLimitError`, which preserves the raw
+response and exposes parsed request ID and rate-limit headers when Kalshi
+provides them. Kalshi currently does not guarantee rate-limit response headers.
+
+Register an optional observer to capture response status, latency, headers,
+and errors without changing request behavior:
+
+```python
+from fastkalshi.rest import KalshiRequestEvent, set_request_observer
+
+
+def observe(event: KalshiRequestEvent) -> None:
+    print(event.method, event.status_code, event.elapsed_seconds)
+
+
+set_request_observer(observe)
+```
+
+Observer failures are isolated from API requests. Applications remain
+responsible for retry and pacing policy, especially for uncertain mutations.
+
 Order groups, queue positions, event live data, and cancel-all controls are
 available from `portfolio` and `market`.
 `exchange.GetUserDataTimestamp()` reports portfolio-data freshness for
