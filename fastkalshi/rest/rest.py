@@ -2,6 +2,8 @@ import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import orjson
@@ -105,6 +107,30 @@ def _header_int(headers: Mapping[str, str], *names: str) -> int | None:
         return None
 
 
+def _header_datetime(headers: Mapping[str, str], name: str) -> datetime | None:
+    value = _header_value(headers, name)
+    if value is None:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+    except TypeError, ValueError, OverflowError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _retry_after_seconds(headers: Mapping[str, str]) -> float | None:
+    delay_seconds = _header_float(headers, "Retry-After")
+    if delay_seconds is not None:
+        return delay_seconds
+    retry_at = _header_datetime(headers, "Retry-After")
+    if retry_at is None:
+        return None
+    reference = _header_datetime(headers, "Date") or datetime.now(UTC)
+    return max(0.0, (retry_at - reference).total_seconds())
+
+
 class KalshiAPIError(requests.HTTPError):
     def __init__(
         self,
@@ -162,7 +188,7 @@ class KalshiRateLimitError(KalshiAPIError):
             payload=payload,
             response=response,
         )
-        self.retry_after_seconds = _header_float(self.headers, "Retry-After")
+        self.retry_after_seconds = _retry_after_seconds(self.headers)
         self.limit = _header_int(self.headers, "X-RateLimit-Limit")
         self.remaining = _header_int(self.headers, "X-RateLimit-Remaining")
         self.reset = _header_float(self.headers, "X-RateLimit-Reset")

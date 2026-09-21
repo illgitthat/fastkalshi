@@ -120,6 +120,28 @@ def test_rate_limit_error_exposes_response_metadata(monkeypatch):
     assert caught.value.response is response_value
 
 
+def test_rate_limit_error_parses_retry_after_http_date(monkeypatch):
+    monkeypatch.setattr(
+        rest.WRITE_SESSION,
+        "request",
+        Mock(
+            return_value=response(
+                429,
+                {"error": {"message": "too many requests"}},
+                headers={
+                    "Date": "Sun, 20 Sep 2026 20:00:00 GMT",
+                    "Retry-After": "Sun, 20 Sep 2026 20:00:05 GMT",
+                },
+            )
+        ),
+    )
+
+    with pytest.raises(rest.KalshiRateLimitError) as caught:
+        rest.request("POST", "https://example.test/orders", body={})
+
+    assert caught.value.retry_after_seconds == 5.0
+
+
 def test_request_observer_receives_success_and_error(monkeypatch):
     events = []
     rest.set_request_observer(events.append)
@@ -145,6 +167,27 @@ def test_request_observer_receives_success_and_error(monkeypatch):
     assert events[0].error is None
     assert isinstance(events[1].error, rest.KalshiRateLimitError)
     assert all(event.elapsed_seconds >= 0 for event in events)
+
+
+def test_request_observer_receives_transport_error(monkeypatch):
+    events = []
+    rest.set_request_observer(events.append)
+    monkeypatch.setattr(
+        rest.SESSION,
+        "request",
+        Mock(side_effect=requests.ConnectionError("connection failed")),
+    )
+    try:
+        with pytest.raises(rest.KalshiTransportError) as caught:
+            rest.request("GET", "https://example.test/markets")
+    finally:
+        rest.set_request_observer(None)
+
+    assert len(events) == 1
+    assert events[0].status_code is None
+    assert events[0].headers == {}
+    assert events[0].error is caught.value
+    assert events[0].elapsed_seconds >= 0
 
 
 def test_request_observer_errors_are_logged_without_breaking_requests(
