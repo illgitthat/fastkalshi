@@ -533,6 +533,7 @@ def test_buffer_overflow_stops_buffered_deltas():
             "msg": {
                 "market_ticker": "A",
                 "market_id": "",
+                "yes_dollars_fp": [["0.5000", "1.00"]],
             },
         },
         {
@@ -634,5 +635,35 @@ def test_connect_reports_protocol_close_once(monkeypatch):
         await client.connect()
 
         assert client.closes == [(1011, "WebSocket subscription buffer overflow")]
+
+    asyncio.run(run())
+
+
+def test_closed_market_snapshot_is_delivered_without_closing_socket():
+    async def run():
+        client = RecordingClient()
+        client.ws = FakeWebSocket()
+        # Captured from production for a determined market (2026-09-23).
+        closed = {
+            "type": "orderbook_snapshot",
+            "sid": 1,
+            "seq": 1,
+            "msg": {
+                "market_ticker": "KXMLBGAME-26SEP231310WSHDET-DET",
+                "market_id": "",
+            },
+        }
+        live = {
+            "type": "orderbook_snapshot",
+            "sid": 1,
+            "seq": 2,
+            "msg": {"market_ticker": "A", "market_id": MARKET_A_ID},
+        }
+
+        assert await client._handle_protocol_message(closed) is True
+        assert await client._handle_protocol_message(live) is True
+
+        assert [message["seq"] for message in client.messages] == [1, 2]
+        assert client.ws.closed is None
 
     asyncio.run(run())
