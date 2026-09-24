@@ -24,6 +24,19 @@ SubscriptionAction = Literal[
 ]
 
 
+def _is_closed_market_snapshot(message_type: str, payload: dict) -> bool:
+    """Production sends ``market_id: ""`` and no price levels for closed markets.
+
+    This departs from the AsyncAPI ``marketId`` format (uuid). Treating it as an
+    empty book keeps one closed market from dropping every other subscription.
+    """
+    return (
+        message_type == "orderbook_snapshot"
+        and "yes_dollars_fp" not in payload
+        and "no_dollars_fp" not in payload
+    )
+
+
 class KalshiWebSocketError(RuntimeError):
     def __init__(
         self,
@@ -294,7 +307,7 @@ class Client:
                 not isinstance(market_ticker, str)
                 or not market_ticker
                 or not isinstance(market_id, str)
-                or not market_id
+                or not (market_id or _is_closed_market_snapshot(message_type, payload))
             ):
                 return await self._reject_protocol_message(
                     f"{message_type} requires valid market_ticker and market_id fields"
@@ -314,7 +327,8 @@ class Client:
                         "orderbook_delta requires string price_dollars and "
                         "delta_fp fields plus side=yes|no"
                     )
-            market_key = market_id
+            # AsyncAPI names market_ticker the unique identifier for this channel.
+            market_key = market_ticker
             ready_markets = self._orderbook_snapshots.setdefault(
                 subscription_id,
                 set(),
