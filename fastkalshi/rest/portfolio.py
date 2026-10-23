@@ -68,7 +68,12 @@ class Portfolio:
         )
 
     def Warmup(self):
-        url = api_url("portfolio/balance")
+        """Keep the order-write TLS session warm with a cheap read (exchange status).
+
+        Not ``portfolio/balance``: that endpoint has its own 1 call/s bucket with
+        no burst, so periodic warm-ups there make real balance reads fail with 429.
+        """
+        url = api_url("exchange/status")
         return get(
             url,
             headers=request_headers("GET", url),
@@ -327,7 +332,7 @@ class Portfolio:
     GetSettlements = GetPortfolioSettlements
 
     def GetPortfolioRestingOrderTotalValue(self):
-        url = api_url("portfolio/summary/total_resting_order_value")
+        url = api_url("exchange/status")
         return self._authenticated_get_request(url)
 
     def IntraExchangeInstanceTransfer(

@@ -100,6 +100,8 @@ def test_portfolio_warmup_uses_mutation_session(monkeypatch):
 
     assert read_request.call_count == 0
     assert write_request.call_count == 1
+    # The balance endpoint's own 1/s bucket stays free for real balance reads.
+    assert "portfolio/balance" not in write_request.call_args.args[1]
 
 
 def test_orderbook_request_is_authenticated(recorded_request):
