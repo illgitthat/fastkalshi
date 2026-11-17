@@ -25,15 +25,18 @@ SubscriptionAction = Literal[
 
 
 def _is_closed_market_snapshot(message_type: str, payload: dict) -> bool:
-    """Production sends ``market_id: ""`` and no price levels for closed markets.
+    """Production sends ``market_id: ""`` and no price levels for closed markets
+    and, from 2026-11-19, for a market with no recorded change yet (a new market
+    without an order); its first ``orderbook_delta`` carries the id.
 
     This departs from the AsyncAPI ``marketId`` format (uuid). Treating it as an
-    empty book keeps one closed market from dropping every other subscription.
+    empty book keeps one such market from dropping every other subscription.
+    The levels may be absent or empty lists.
     """
     return (
         message_type == "orderbook_snapshot"
-        and "yes_dollars_fp" not in payload
-        and "no_dollars_fp" not in payload
+        and not payload.get("yes_dollars_fp")
+        and not payload.get("no_dollars_fp")
     )
 
 
