@@ -660,10 +660,25 @@ def test_closed_market_snapshot_is_delivered_without_closing_socket():
             "msg": {"market_ticker": "A", "market_id": MARKET_A_ID},
         }
 
+        # Kalshi changelog 2026-11-19: a market with no recorded change also has
+        # an empty market_id; the levels may come as empty lists.
+        unchanged = {
+            "type": "orderbook_snapshot",
+            "sid": 1,
+            "seq": 3,
+            "msg": {
+                "market_ticker": "B",
+                "market_id": "",
+                "yes_dollars_fp": [],
+                "no_dollars_fp": [],
+            },
+        }
+
         assert await client._handle_protocol_message(closed) is True
         assert await client._handle_protocol_message(live) is True
+        assert await client._handle_protocol_message(unchanged) is True
 
-        assert [message["seq"] for message in client.messages] == [1, 2]
+        assert [message["seq"] for message in client.messages] == [1, 2, 3]
         assert client.ws.closed is None
 
     asyncio.run(run())
